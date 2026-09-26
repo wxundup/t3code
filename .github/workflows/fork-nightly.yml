@@ -112,6 +112,7 @@ jobs:
         if: steps.merge.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           assets=$(ls release/*.dmg release/*.zip release/*.blockmap release/*.yml 2>/dev/null || true)
