@@ -58,6 +58,7 @@ import {
   makeAcpRequestOpenedEvent,
   makeAcpRequestResolvedEvent,
   makeAcpToolCallEvent,
+  makeAcpUsageEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
 import { makeAcpNativeLoggerFactory } from "../acp/AcpNativeLogging.ts";
 import { parsePermissionRequest, type AcpToolCallState } from "../acp/AcpRuntimeModel.ts";
@@ -597,6 +598,19 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             ...(event._tag === "ContentDelta" && event.itemId ? { itemId: event.itemId } : {}),
             ...(event._tag === "ThoughtDelta" ? { streamKind: "reasoning_text" } : {}),
             text: event.text,
+            rawPayload: sanitizeAntigravityToolPayload(event.rawPayload),
+          }),
+        );
+        return;
+      case "UsageUpdated":
+        yield* emit(
+          makeAcpUsageEvent({
+            stamp: yield* stamp,
+            provider: PROVIDER,
+            threadId: context.threadId,
+            turnId: context.activeTurnId,
+            size: event.size,
+            used: event.used,
             rawPayload: sanitizeAntigravityToolPayload(event.rawPayload),
           }),
         );

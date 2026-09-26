@@ -11,7 +11,7 @@
  */
 import * as Schema from "effect/Schema";
 
-import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 /**
  * Bumped whenever the shape of {@link UsageSummary} changes incompatibly. The
@@ -219,3 +219,47 @@ export class UsageReadError extends Schema.TaggedError<UsageReadError>()("UsageR
     return `Usage read failed (${this.reason}): ${this.detail}`;
   }
 }
+
+export const UsageThreadUsageInput = Schema.Struct({
+  threadId: ThreadId,
+});
+export type UsageThreadUsageInput = typeof UsageThreadUsageInput.Type;
+
+/**
+ * Cost and tokens for one thread, priced by the same pipeline as
+ * {@link UsageSummary}. Records the thread's provider wrote to disk are
+ * filtered by its native session id, so this works for sessions that ran
+ * before this contract existed.
+ *
+ * `contextUsedTokens` is the live context fill the provider last reported
+ * (null when the provider reports none). `costUsd` is null when no record was
+ * found or none could be priced; clients must hide the cost figure in that
+ * case rather than showing zero.
+ */
+export const UsageThreadUsage = Schema.Struct({
+  totals: UsageTokenTotals,
+  records: NonNegativeInt,
+  lastTimestampMs: Schema.NullOr(Schema.Number),
+  costUsd: Schema.NullOr(Schema.Number),
+  costSource: UsageCostSource,
+  contextUsedTokens: Schema.NullOr(NonNegativeInt),
+  contextMaxTokens: Schema.NullOr(PositiveInt),
+});
+export type UsageThreadUsage = typeof UsageThreadUsage.Type;
+
+/** Value for a thread whose transcript usage is unknown. */
+export const emptyUsageThreadUsage = (): UsageThreadUsage => ({
+  totals: {
+    uncachedInputTokens: 0,
+    cachedInputTokens: 0,
+    cacheCreationTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+  },
+  records: 0,
+  lastTimestampMs: null,
+  costUsd: null,
+  costSource: "unpriced",
+  contextUsedTokens: null,
+  contextMaxTokens: null,
+});

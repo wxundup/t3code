@@ -608,15 +608,15 @@ describe("ClientSettings sidebar", () => {
   });
 });
 
-describe("ClientSettings context window meter", () => {
-  it("defaults off and preserves an explicit legacy opt-in", () => {
-    expect(decodeClientSettings({}).contextWindowMeterEnabled).toBe(false);
-    expect(
-      decodeClientSettings({ contextWindowMeterEnabled: true }).contextWindowMeterEnabled,
-    ).toBe(true);
-    expect(
-      decodeClientSettingsPatch({ contextWindowMeterEnabled: true }).contextWindowMeterEnabled,
-    ).toBe(true);
+describe("ClientSettings context usage position", () => {
+  it("defaults to the right side and preserves an explicit side", () => {
+    expect(decodeClientSettings({}).contextUsagePosition).toBe("right");
+    expect(decodeClientSettings({ contextUsagePosition: "left" }).contextUsagePosition).toBe(
+      "left",
+    );
+    expect(decodeClientSettingsPatch({ contextUsagePosition: "left" }).contextUsagePosition).toBe(
+      "left",
+    );
   });
 });
 

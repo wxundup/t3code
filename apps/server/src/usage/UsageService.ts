@@ -26,6 +26,8 @@ import {
   type UsagePricing,
   type UsageSummary,
   type UsageSummaryInput,
+  type UsageThreadUsage,
+  emptyUsageThreadUsage,
   UsageReadError,
 } from "@t3tools/contracts";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -55,6 +57,7 @@ import { readAntigravityUsage } from "./antigravityUsageReader.ts";
 import { readCursorAccountUsage } from "./cursorUsageReader.ts";
 import { UsageAggregator } from "./usageAggregation.ts";
 import { createOverrideRateTable, parseRateTable, type RateTable } from "./usagePricing.ts";
+import { summarizeThreadUsage } from "./threadUsage.ts";
 import {
   listTranscriptFiles,
   readDirectoryVolumeId,
@@ -117,6 +120,14 @@ export class UsageService extends Context.Service<
   UsageService,
   {
     readonly readSummary: (input: UsageSummaryInput) => Effect.Effect<UsageSummary, UsageReadError>;
+    /**
+     * Cost and token totals for one thread, filtered from the transcripts the
+     * thread's provider wrote under the thread's native session id.
+     */
+    readonly readThreadUsage: (input: {
+      readonly provider: UsageProviderKind;
+      readonly sessionId: string;
+    }) => Effect.Effect<UsageThreadUsage, UsageReadError>;
     /** Refetches the rate table ahead of its TTL. See `ensureRates`. */
     readonly refreshRates: Effect.Effect<UsagePricing>;
   }
@@ -145,6 +156,7 @@ export const layerTest = Layer.succeed(
         pricing: EMPTY_PRICING,
         scanDurationMs: 0,
       }),
+    readThreadUsage: () => Effect.succeed(emptyUsageThreadUsage()),
     refreshRates: Effect.succeed(EMPTY_PRICING),
   }),
 );
@@ -260,6 +272,7 @@ export const make = Effect.gen(function* () {
   const resolveTranscriptDirs = Effect.fn("UsageService.resolveTranscriptDirs")(function* (
     settings: ServerSettingsValue,
     retentionCutoffMs: number,
+    only?: UsageProviderKind,
   ) {
     const dirs: Array<{
       provider: UsageProviderKind;
@@ -269,6 +282,8 @@ export const make = Effect.gen(function* () {
     }> = [];
     const seen = new Set<string>();
     for (const driver of ["claudeAgent", "codex", "grok"] as const) {
+      const provider = driver === "claudeAgent" ? "claude" : driver;
+      if (only !== undefined && provider !== only) continue;
       // Disabled accounts still have history. Explicit default slots replace
       // the legacy settings, just as they do in the provider registry.
       const instances: Array<Pick<ProviderInstanceConfig, "config" | "environment">> =
@@ -278,7 +293,6 @@ export const make = Effect.gen(function* () {
       }
       for (const instance of instances) {
         const environment = mergeProviderInstanceEnvironment(instance.environment, hostEnvironment);
-        const provider = driver === "claudeAgent" ? "claude" : driver;
         let home: string;
         if (driver === "codex") {
           const decoded = decodeCodexSettings(instance.config ?? {});
@@ -468,10 +482,11 @@ export const make = Effect.gen(function* () {
     windowStartMs: number,
     settings: ServerSettingsValue,
     retentionCutoffMs: number,
+    only?: UsageProviderKind,
   ) {
     // The home resolvers ask for `Path` themselves; satisfy them from the
     // instance we already hold so the scan stays context-free.
-    const dirs = yield* resolveTranscriptDirs(settings, retentionCutoffMs).pipe(
+    const dirs = yield* resolveTranscriptDirs(settings, retentionCutoffMs, only).pipe(
       Effect.provideService(Path.Path, path),
     );
     const scanned: ScannedDir[] = [];
@@ -510,12 +525,14 @@ export const make = Effect.gen(function* () {
       return [...canonical];
     });
     const dataHome = hostEnvironment["XDG_DATA_HOME"]?.trim();
-    for (const dir of yield* envRoots("OPENCODE_DATA_DIR", [
-      path.join(
-        dataHome && path.isAbsolute(dataHome) ? dataHome : path.join(home, ".local", "share"),
-        "opencode",
-      ),
-    ])) {
+    for (const dir of only === undefined || only === "opencode"
+      ? yield* envRoots("OPENCODE_DATA_DIR", [
+          path.join(
+            dataHome && path.isAbsolute(dataHome) ? dataHome : path.join(home, ".local", "share"),
+            "opencode",
+          ),
+        ])
+      : []) {
       const result = yield* Effect.promise(() => readOpenCodeUsage(dir, windowStartMs));
       scanned.push({
         provider: "opencode",
@@ -526,62 +543,67 @@ export const make = Effect.gen(function* () {
         ...(result.error ? { message: "Some OpenCode history could not be read." } : {}),
       });
     }
-    const antigravityRoots = yield* envRoots("ANTIGRAVITY_DATA_DIR", [
-      ...["antigravity", "antigravity-cli", "antigravity-ide", "antigravity-backup"].map((name) =>
-        path.join(home, ".gemini", name),
-      ),
-      path.join(home, ".config", "antigravity"),
-    ]);
-    for (const [instanceId, instance] of Object.entries(settings.providerInstances)) {
-      if (instance.driver === "antigravity") {
-        const directories = yield* resolveAntigravityInstanceDirectories(
-          config.stateDir,
-          ProviderInstanceId.make(instanceId),
-        ).pipe(
-          Effect.provideService(Crypto.Crypto, crypto),
-          Effect.provideService(Path.Path, path),
-          Effect.mapError(
-            (cause) =>
-              new UsageReadError({
-                reason: "scanFailed",
-                detail: "Antigravity profile directory could not be resolved.",
-                cause,
-              }),
-          ),
+    if (only === undefined || only === "antigravity") {
+      const antigravityRoots = yield* envRoots("ANTIGRAVITY_DATA_DIR", [
+        ...["antigravity", "antigravity-cli", "antigravity-ide", "antigravity-backup"].map((name) =>
+          path.join(home, ".gemini", name),
+        ),
+        path.join(home, ".config", "antigravity"),
+      ]);
+      for (const [instanceId, instance] of Object.entries(settings.providerInstances)) {
+        if (instance.driver === "antigravity") {
+          const directories = yield* resolveAntigravityInstanceDirectories(
+            config.stateDir,
+            ProviderInstanceId.make(instanceId),
+          ).pipe(
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.provideService(Path.Path, path),
+            Effect.mapError(
+              (cause) =>
+                new UsageReadError({
+                  reason: "scanFailed",
+                  detail: "Antigravity profile directory could not be resolved.",
+                  cause,
+                }),
+            ),
+          );
+          antigravityRoots.push(path.join(directories.profile, "antigravity-acp"));
+        }
+      }
+      const antigravityDirs = new Set<string>();
+      for (const root of antigravityRoots) {
+        const resolvedRoot = yield* fileSystem
+          .realPath(root)
+          .pipe(Effect.orElseSucceed(() => root));
+        const nested = path.join(resolvedRoot, "conversations");
+        const dir = (yield* fileSystem
+          .exists(nested)
+          .pipe(Effect.catchCause(() => Effect.succeed(false))))
+          ? nested
+          : resolvedRoot;
+        antigravityDirs.add(yield* fileSystem.realPath(dir).pipe(Effect.orElseSucceed(() => dir)));
+      }
+      const antigravity = yield* Effect.promise(() =>
+        readAntigravityUsage([...antigravityDirs], windowStartMs),
+      );
+      for (const dir of antigravityDirs) {
+        const exists = yield* fileSystem
+          .exists(dir)
+          .pipe(Effect.catchCause(() => Effect.succeed(false)));
+        const failed = antigravity.errors.some(
+          (error) => error === dir || error.startsWith(`${dir}${path.sep}`),
         );
-        antigravityRoots.push(path.join(directories.profile, "antigravity-acp"));
+        scanned.push({
+          provider: "antigravity",
+          dir,
+          volumeId: yield* Effect.promise(() => readDirectoryVolumeId(dir)),
+          files: !exists && !failed ? null : antigravity.files.filter((file) => file.root === dir),
+          status: failed ? "partial" : "ok",
+          ...(failed ? { message: "Some Antigravity history could not be read." } : {}),
+        });
       }
     }
-    const antigravityDirs = new Set<string>();
-    for (const root of antigravityRoots) {
-      const resolvedRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
-      const nested = path.join(resolvedRoot, "conversations");
-      const dir = (yield* fileSystem
-        .exists(nested)
-        .pipe(Effect.catchCause(() => Effect.succeed(false))))
-        ? nested
-        : resolvedRoot;
-      antigravityDirs.add(yield* fileSystem.realPath(dir).pipe(Effect.orElseSucceed(() => dir)));
-    }
-    const antigravity = yield* Effect.promise(() =>
-      readAntigravityUsage([...antigravityDirs], windowStartMs),
-    );
-    for (const dir of antigravityDirs) {
-      const exists = yield* fileSystem
-        .exists(dir)
-        .pipe(Effect.catchCause(() => Effect.succeed(false)));
-      const failed = antigravity.errors.some(
-        (error) => error === dir || error.startsWith(`${dir}${path.sep}`),
-      );
-      scanned.push({
-        provider: "antigravity",
-        dir,
-        volumeId: yield* Effect.promise(() => readDirectoryVolumeId(dir)),
-        files: !exists && !failed ? null : antigravity.files.filter((file) => file.root === dir),
-        status: failed ? "partial" : "ok",
-        ...(failed ? { message: "Some Antigravity history could not be read." } : {}),
-      });
-    }
+    if (only !== undefined && only !== "cursor") return scanned;
     const cursorUserHome =
       (platform === "win32" ? hostEnvironment["USERPROFILE"] : hostEnvironment["HOME"]) || home;
     const configHome = hostEnvironment["XDG_CONFIG_HOME"]?.trim();
@@ -881,7 +903,68 @@ export const make = Effect.gen(function* () {
     return yield* Deferred.await(deferred);
   });
 
-  return { readSummary, refreshRates } as const;
+  /**
+   * Cost and token totals for one thread.
+   *
+   * Only the thread's provider is scanned: a hover must not pay for a Cursor
+   * account API call it will never match. The window matches the retention
+   * window the usage page offers, so a thread older than that reports unknown
+   * cost rather than a partial figure.
+   */
+  const readThreadUsage = Effect.fn("UsageService.readThreadUsage")(function* (input: {
+    readonly provider: UsageProviderKind;
+    readonly sessionId: string;
+  }) {
+    if (input.sessionId.length === 0) return emptyUsageThreadUsage();
+    const settings = yield* readSettings;
+    const now = yield* Clock.currentTimeMillis;
+    const retentionCutoffMs = now - CACHE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    const windowStartMs = retentionCutoffMs - MTIME_SLACK_MS;
+
+    const [, scannedDirs] = yield* Effect.all(
+      [ensureRates(false), collectDirs(windowStartMs, settings, retentionCutoffMs, input.provider)],
+      { concurrency: 2 },
+    );
+
+    // Grouping per file mirrors `scanSummary`: identical codex events are
+    // numbered per file so a moved rollout copy collapses while an A-B-A
+    // pattern inside one rollout survives.
+    const filtered: UsageRecord[] = [];
+    for (const scanned of scannedDirs) {
+      if (scanned.provider !== input.provider || scanned.files === null) continue;
+      for (const file of scanned.files) {
+        const occurrences = new Map<string, number>();
+        for (const record of file.records) {
+          if (record.sessionId !== input.sessionId) continue;
+          let usageRecord = record;
+          if (input.provider === "codex") {
+            // Same key shape `scanSummary` uses for moved-rollout copies.
+            const key = encodeUsageRecordKey([
+              record.provider,
+              record.sessionId,
+              record.timestampMs,
+              record.model,
+              record.totals,
+            ]);
+            const occurrence = (occurrences.get(key) ?? 0) + 1;
+            occurrences.set(key, occurrence);
+            usageRecord = { ...record, dedupeKey: key + ":" + occurrence };
+          }
+          filtered.push(usageRecord);
+        }
+      }
+    }
+
+    return summarizeThreadUsage(
+      {
+        rates,
+        priceOverrides: createOverrideRateTable(settings.usagePriceOverrides),
+      },
+      filtered,
+    );
+  });
+
+  return { readSummary, readThreadUsage, refreshRates } as const;
 });
 
 export const layer = Layer.effect(UsageService, make);

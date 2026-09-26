@@ -10,6 +10,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { mergeUsage } from "@t3tools/shared/usageMerge";
 import {
+  emptyUsageThreadUsage,
   EnvironmentId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -139,6 +140,85 @@ describe("UsageService", () => {
       const cursor = summary.sources.find((source) => source.fingerprint.provider === "cursor");
       assert.strictEqual(cursor?.status, "missing");
       assert.strictEqual(cursor?.action, "enableCursorKeychain");
+    }).pipe(Effect.scoped),
+  );
+
+  it.live("prices per-thread usage from the thread's own transcript records", () =>
+    Effect.gen(function* () {
+      const { transcript, settings, home } = yield* setup;
+      const codexHome = NodePath.join(home, "codex");
+      yield* Effect.promise(async () => {
+        await NodeFSP.writeFile(transcript, [claudeLine(1, 5), claudeLine(2, 7)].join(""));
+        await NodeFSP.mkdir(NodePath.join(codexHome, "sessions"), { recursive: true });
+        await NodeFSP.writeFile(
+          NodePath.join(codexHome, "sessions", "rollout-1.jsonl"),
+          [
+            { type: "session_meta", payload: { id: "codex-session-1" } },
+            { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+            // A-B-A at one timestamp must preserve both equal A events.
+            ...[11, 12, 11].map((outputTokens) => ({
+              type: "event_msg",
+              timestamp: "2026-08-01T10:00:00Z",
+              payload: {
+                type: "token_count",
+                info: { last_token_usage: { input_tokens: 10, output_tokens: outputTokens } },
+              },
+            })),
+          ]
+            .map((line) => encodeUnknownJsonString(line))
+            .join("\n") + "\n",
+        );
+      });
+      const service = yield* UsageService.make.pipe(
+        Effect.provide(
+          serviceLayers({
+            prefix: "usage-service-thread-usage",
+            home,
+            settings,
+            ratesDocument: {
+              "claude-fable-5": { input_cost_per_token: 1e-5, output_cost_per_token: 5e-5 },
+            },
+          }),
+        ),
+      );
+
+      const claude = yield* service.readThreadUsage({ provider: "claude", sessionId: "session-1" });
+      assert.strictEqual(claude.records, 2);
+      assert.strictEqual(claude.totals.outputTokens, 12);
+      assert.strictEqual(claude.costSource, "modelPriced");
+      // 2 * 10*1e-5 input + 12*5e-5 output
+      assert.ok(Math.abs((claude.costUsd ?? 0) - 0.0008) < 1e-12);
+      assert.strictEqual(claude.lastTimestampMs, Date.parse("2026-08-01T10:00:00Z"));
+
+      const codex = yield* service.readThreadUsage({
+        provider: "codex",
+        sessionId: "codex-session-1",
+      });
+      assert.strictEqual(codex.records, 3);
+      assert.strictEqual(codex.totals.outputTokens, 34);
+      // gpt-5.6-sol is not in the rate table, so the cost stays unknown.
+      assert.strictEqual(codex.costUsd, null);
+      assert.strictEqual(codex.costSource, "unpriced");
+
+      // An identical rollout copy under another path must not double count.
+      yield* Effect.promise(() =>
+        NodeFSP.copyFile(
+          NodePath.join(codexHome, "sessions", "rollout-1.jsonl"),
+          NodePath.join(codexHome, "sessions", "rollout-2.jsonl"),
+        ),
+      );
+      const copied = yield* service.readThreadUsage({
+        provider: "codex",
+        sessionId: "codex-session-1",
+      });
+      assert.strictEqual(copied.records, 3);
+      assert.strictEqual(copied.totals.outputTokens, 34);
+
+      const missing = yield* service.readThreadUsage({
+        provider: "claude",
+        sessionId: "session-none",
+      });
+      assert.deepStrictEqual(missing, emptyUsageThreadUsage());
     }).pipe(Effect.scoped),
   );
 

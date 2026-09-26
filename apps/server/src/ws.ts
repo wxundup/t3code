@@ -68,6 +68,8 @@ import {
   AssetWorkspaceContextResolutionError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  emptyUsageThreadUsage,
+  type UsageThreadUsage,
   ThreadId,
   type TerminalAttachStreamEvent,
   type TerminalError,
@@ -113,6 +115,8 @@ import * as ModelManifest from "./provider/ModelManifest.ts";
 import * as ProviderMaintenance from "./provider/providerMaintenance.ts";
 import * as ProviderService from "./provider/Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDirectory.ts";
+import * as ProjectionThreadActivityRepository from "./persistence/Services/ProjectionThreadActivities.ts";
+import { ProjectionThreadActivityRepositoryLive } from "./persistence/Layers/ProjectionThreadActivities.ts";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import { ProviderAuthService } from "./provider/Services/ProviderAuthService.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
@@ -157,6 +161,7 @@ import * as HostResources from "./resourceTelemetry/HostResources.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as UsageService from "./usage/UsageService.ts";
+import { threadUsageKey } from "./usage/threadUsage.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
 import { listLinkedPullRequestThreads } from "./pullRequest/linkedThreads.ts";
@@ -669,6 +674,47 @@ const makeWsRpcLayer = (
       const processResourceMonitor = yield* ProcessResourceMonitor.ProcessResourceMonitor;
       const resourceTelemetry = yield* ResourceTelemetry.ResourceTelemetry;
       const usage = yield* UsageService.UsageService;
+      const projectionThreadActivityRepository =
+        yield* ProjectionThreadActivityRepository.ProjectionThreadActivityRepository;
+      // A thread whose provider session cursor cannot be resolved, or whose
+      // scan fails, simply has no known cost; hover surfaces hide it.
+      const withLatestContextUsage = (threadId: ThreadId, threadUsage: UsageThreadUsage) =>
+        projectionThreadActivityRepository
+          .listByThreadId({ threadId, activityKinds: ["context-window.updated"], limit: 1 })
+          .pipe(
+            Effect.map((activities) => {
+              const snapshot = activities[0]?.payload as
+                | { usedTokens?: unknown; maxTokens?: unknown }
+                | undefined;
+              const usedTokens =
+                typeof snapshot?.usedTokens === "number" ? snapshot.usedTokens : null;
+              const maxTokens = typeof snapshot?.maxTokens === "number" ? snapshot.maxTokens : null;
+              return {
+                ...threadUsage,
+                contextUsedTokens: usedTokens,
+                contextMaxTokens: usedTokens === null ? null : maxTokens,
+              };
+            }),
+            Effect.catchCause(() => Effect.succeed(threadUsage)),
+          );
+      const resolveThreadUsage = (threadId: ThreadId) =>
+        providerSessionDirectory.getBinding(threadId).pipe(
+          Effect.map((binding) =>
+            Option.isSome(binding)
+              ? threadUsageKey(binding.value.provider, binding.value.resumeCursor)
+              : null,
+          ),
+          Effect.flatMap((key) =>
+            key === null
+              ? withLatestContextUsage(threadId, emptyUsageThreadUsage())
+              : usage
+                  .readThreadUsage(key)
+                  .pipe(
+                    Effect.flatMap((threadUsage) => withLatestContextUsage(threadId, threadUsage)),
+                  ),
+          ),
+          Effect.catchCause(() => Effect.succeed(emptyUsageThreadUsage())),
+        );
       const relayClient = yield* RelayClient.RelayClient;
       const authorizationError = (requiredScope: AuthEnvironmentScope) =>
         new EnvironmentAuthorizationError({
@@ -2673,6 +2719,10 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.serverGetUsageSummary, usage.readSummary(input), {
             "rpc.aggregate": "server",
           }),
+        [WS_METHODS.serverGetThreadUsage]: (input) =>
+          observeRpcEffect(WS_METHODS.serverGetThreadUsage, resolveThreadUsage(input.threadId), {
+            "rpc.aggregate": "server",
+          }),
         [WS_METHODS.serverRefreshUsageRates]: (_input) =>
           observeRpcEffect(WS_METHODS.serverRefreshUsageRates, usage.refreshRates, {
             "rpc.aggregate": "server",
@@ -3858,6 +3908,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
+              Layer.provide(ProjectionThreadActivityRepositoryLive),
               Layer.provide(AgentSessionScanner.layer),
               Layer.provide(ProviderMaintenanceRunner.layer),
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),

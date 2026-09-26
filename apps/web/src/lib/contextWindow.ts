@@ -89,3 +89,23 @@ export function formatContextWindowTokens(value: number | null): string {
   }
   return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
 }
+
+function formatContextWindowPercentage(value: number): string {
+  if (value < 10) {
+    return `${value.toFixed(1).replace(/\.0$/, "")}%`;
+  }
+  return `${Math.round(value)}%`;
+}
+
+/**
+ * `32% · 81.7k/258k`, matching the composer's context meter. Without a known
+ * window size the label degrades to bare token counts (`81.7k`).
+ */
+export function formatContextWindowUsage(usedTokens: number, maxTokens: number | null): string {
+  const used = formatContextWindowTokens(usedTokens);
+  if (maxTokens === null || !Number.isFinite(maxTokens) || maxTokens <= 0) {
+    return used;
+  }
+  const percentage = Math.min(100, (usedTokens / maxTokens) * 100);
+  return `${formatContextWindowPercentage(percentage)} · ${used}/${formatContextWindowTokens(maxTokens)}`;
+}

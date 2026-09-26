@@ -10,8 +10,10 @@ import { useAtomValue } from "@effect/atom-react";
 import {
   USAGE_CONTRACT_VERSION,
   type EnvironmentId,
+  type ThreadId,
   type UsageSummary,
   type UsageSummaryInput,
+  type UsageThreadUsage,
 } from "@t3tools/contracts";
 import { needsCursorKeychainAccess, refreshUsage } from "@t3tools/client-runtime/state/usage";
 import * as Option from "effect/Option";
@@ -156,4 +158,24 @@ export function useUsage(
     isPartial: answeredCount > 0 && stillReporting > 0,
     refresh,
   };
+}
+
+const EMPTY_THREAD_USAGE_ATOM = Atom.make(AsyncResult.initial<UsageThreadUsage, never>(false)).pipe(
+  Atom.withLabel("web-usage:thread-usage-empty"),
+);
+
+/**
+ * Cost and context usage for one thread. Reading the atom issues the query on
+ * first use; results stay cached per thread for a minute.
+ */
+export function useThreadUsage(
+  environmentId: EnvironmentId | null,
+  threadId: ThreadId | null,
+): UsageThreadUsage | null {
+  const result = useAtomValue(
+    environmentId !== null && threadId !== null
+      ? serverEnvironment.threadUsage({ environmentId, input: { threadId } })
+      : EMPTY_THREAD_USAGE_ATOM,
+  );
+  return Option.getOrNull(AsyncResult.value(result));
 }

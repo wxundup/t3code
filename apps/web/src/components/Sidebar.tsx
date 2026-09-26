@@ -1,6 +1,9 @@
 import { requestCustomSnooze } from "./CustomSnoozeDialog";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
+import { formatSessionTooltipUsage } from "~/lib/usageLabel";
+import { useThreadUsage } from "~/state/usage";
+import type { UsageThreadUsage } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
 import { replaceComposerContextReferences } from "@t3tools/shared/composerContextReferences";
 import * as Schema from "effect/Schema";
@@ -347,6 +350,8 @@ function SidebarThreadTooltip({
 }) {
   const driverKind = providerEntry?.driverKind ?? null;
   const supportsMultiplePullRequests = useSupportsMultiplePullRequests(thread.environmentId);
+  const threadUsage = useThreadUsage(thread.environmentId, thread.id);
+  const tooltipUsage = formatSessionTooltipUsage(modelLabel, threadUsage);
   return (
     <TooltipPopup side="right" align="start" sideOffset={4} variant="glass">
       {/* The viewport's own inset (py-1 px-2) plus this one make the floating inset. */}
@@ -398,10 +403,14 @@ function SidebarThreadTooltip({
                 badgeClassName="h-2 min-w-2 px-0"
                 iconClassName="size-3 shrink-0 grayscale opacity-60"
               />
-              <div className="min-w-0 truncate text-foreground/75">
-                {showInstanceBadge && providerEntry
-                  ? `${modelLabel} · ${providerEntry.displayName}`
-                  : modelLabel}
+              <div className="min-w-0 wrap-anywhere text-foreground/75">
+                {tooltipUsage.model ? <span>{tooltipUsage.model}</span> : null}
+                {tooltipUsage.usage ? (
+                  <span className="text-[8px] text-muted-foreground">
+                    {tooltipUsage.model ? " · " : ""}
+                    {tooltipUsage.usage}
+                  </span>
+                ) : null}
               </div>
             </div>
           ) : null}

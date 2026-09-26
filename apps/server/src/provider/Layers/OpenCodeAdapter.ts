@@ -29,7 +29,13 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
-import type { OpencodeClient, Part, PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2";
+import type {
+  OpencodeClient,
+  Part,
+  PermissionRequest,
+  ProviderListResponse,
+  QuestionRequest,
+} from "@opencode-ai/sdk/v2";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
@@ -354,6 +360,8 @@ interface OpenCodeSessionContext {
   // until native removal or session teardown, but do not retain other part payloads.
   readonly textPartsByMessageId: Map<string, Map<string, OpenCodeTextPartState>>;
   turnTokenUsage: OpenCodeTurnTokenUsageAccumulator | undefined;
+  /** Resolved once per session from the provider list; undefined until known. */
+  modelContextWindow: number | undefined;
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
   activeVariant: string | undefined;
@@ -1098,6 +1106,76 @@ export function makeOpenCodeAdapter(
         readonly event: Record<string, unknown>;
       },
     ) => writeNativeEvent(threadId, event).pipe(Effect.ignoreCause);
+
+    /**
+     * Resolves the active model's context window from OpenCode's own provider
+     * list once per session. OpenCode models carry `limit.context`, which the
+     * usage meter needs for the percentage display. Runs in the background so
+     * the event pump never waits on the provider list.
+     */
+    const resolveOpenCodeModelContextWindow = Effect.fn("resolveOpenCodeModelContextWindow")(
+      function* (context: OpenCodeSessionContext) {
+        if (context.modelContextWindow !== undefined) return context.modelContextWindow;
+        const parsedModel = parseOpenCodeModelSlug(context.session.model ?? "");
+        if (!parsedModel) return undefined;
+        const providers = yield* runOpenCodeSdk("provider.list", (signal) =>
+          context.client.provider.list(undefined, { signal }),
+        ).pipe(
+          Effect.map((result) => result.data?.all ?? []),
+          Effect.catchCause(() => Effect.succeed<ProviderListResponse["all"]>([])),
+        );
+        const model = providers.find((provider) => provider.id === parsedModel.providerID)?.models[
+          parsedModel.modelID
+        ];
+        const contextWindow = model?.limit?.context;
+        if (
+          typeof contextWindow === "number" &&
+          Number.isFinite(contextWindow) &&
+          contextWindow > 0
+        ) {
+          context.modelContextWindow = contextWindow;
+          return contextWindow;
+        }
+        return undefined;
+      },
+    );
+
+    /**
+     * Emits the live context usage from one finished step. The step's input
+     * tokens (including cache reads and writes) plus its output are the
+     * tokens the next model call starts from, matching the semantics the
+     * Claude and Codex snapshots carry. The event id derives from the step
+     * id rather than the UUID generator, so turn bookkeeping that counts
+     * allocations is not perturbed.
+     */
+    const emitOpenCodeContextUsage = Effect.fn("emitOpenCodeContextUsage")(function* (
+      context: OpenCodeSessionContext,
+      part: OpenCodeStepUsage,
+      turnId: TurnId | undefined,
+    ) {
+      const usedTokens =
+        part.tokens.input +
+        part.tokens.cache.read +
+        part.tokens.cache.write +
+        part.tokens.output +
+        part.tokens.reasoning;
+      if (usedTokens <= 0) return;
+      const maxTokens = context.modelContextWindow;
+      yield* emit({
+        eventId: EventId.make(`opencode-usage:${part.id}`),
+        provider: PROVIDER,
+        threadId: context.session.threadId,
+        createdAt: yield* nowIso,
+        ...(turnId ? { turnId } : {}),
+        type: "thread.token-usage.updated",
+        payload: {
+          usage: {
+            usedTokens,
+            ...(maxTokens !== undefined ? { maxTokens } : {}),
+          },
+        },
+      });
+    });
 
     const cancelIdleReconciliation = Effect.fn("cancelIdleReconciliation")(function* (
       context: OpenCodeSessionContext,
@@ -2455,6 +2533,7 @@ export function makeOpenCodeAdapter(
             const ownership = usage.assistantOwnershipByMessageId.get(part.messageID);
             if (ownership === "owned") {
               accumulateOpenCodeStepUsage(usage, part);
+              yield* emitOpenCodeContextUsage(context, part, turnId);
             } else if (
               ownership === "unknown" ||
               (ownership === undefined &&
@@ -3019,6 +3098,7 @@ export function makeOpenCodeAdapter(
           textPartsByMessageId: new Map(),
           messageRoleById: new Map(),
           turnTokenUsage: undefined,
+          modelContextWindow: undefined,
           activeTurnId: undefined,
           activeAgent: undefined,
           activeVariant: undefined,
@@ -3044,6 +3124,12 @@ export function makeOpenCodeAdapter(
           return (yield* awaitOpenCodeContextReady(raceWinner)).session;
         }
         sessions.set(input.threadId, context);
+        // Warm the model's context window in the background; the usage
+        // emitter reads the cached value and never blocks the event pump.
+        yield* resolveOpenCodeModelContextWindow(context).pipe(
+          Effect.ignoreCause,
+          Effect.forkIn(context.sessionScope),
+        );
         const cleanupStartingContext = closeStartingOpenCodeContext(context, started.created).pipe(
           Effect.ensuring(Effect.sync(() => deleteContextIfCurrent(context))),
         );
