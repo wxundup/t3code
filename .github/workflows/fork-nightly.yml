@@ -16,6 +16,11 @@ on:
     # Three times a day, close to upstream's nightly cadence.
     - cron: "0 0,8,16 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Build and publish even when upstream has not moved."
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -37,6 +42,9 @@ jobs:
 
       - name: Merge upstream main
         id: merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           git config user.name "fork-nightly-bot"
           git config user.email "actions@users.noreply.github.com"
@@ -49,11 +57,14 @@ jobs:
             exit 1
           fi
           after=$(git rev-parse HEAD)
-          if [ "$before" = "$after" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
+          if [ "$before" != "$after" ]; then
             git push origin HEAD:feat/session-context-usage-cost
             echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.force }}" = "true" ] || ! gh release view fork-nightly > /dev/null 2>&1; then
+            # Forced run, or the fork has no nightly release yet.
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Skip when upstream is unchanged
