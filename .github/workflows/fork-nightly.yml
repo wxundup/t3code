@@ -1,0 +1,121 @@
+# Personal fork nightly: merges upstream main into the fork's feature branch
+# and publishes an unsigned desktop nightly to a fork release, so the fork
+# build's auto-updater (feed baked in from GITHUB_REPOSITORY) keeps tracking
+# upstream while carrying the fork's changes.
+#
+# The upstream release pipeline shreds the work across a multi-job graph with
+# signing and smoke tests; this one takes the single-command local build path
+# (`vp run dist:desktop:dmg:arm64`) on one macOS runner instead. Builds are
+# unsigned; macOS may need a right-click-open on first install and in-app
+# auto-update may refuse unsigned updates, in which case reinstall the DMG.
+
+name: Fork nightly
+
+on:
+  schedule:
+    # Three times a day, close to upstream's nightly cadence.
+    - cron: "0 0,8,16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-nightly
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/session-context-usage-cost
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git config user.name "fork-nightly-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git remote add upstream https://github.com/pingdotgg/t3code.git
+          git fetch upstream main
+          before=$(git rev-parse HEAD)
+          if ! git merge upstream/main --no-edit; then
+            git merge --abort
+            echo "::error::Upstream merge conflicts with the feature branch. Rebase by hand; nightly skipped."
+            exit 1
+          fi
+          after=$(git rev-parse HEAD)
+          if [ "$before" = "$after" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git push origin HEAD:feat/session-context-usage-cost
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip when upstream is unchanged
+        if: steps.merge.outputs.changed == 'false'
+        run: echo "Upstream main has not moved; keeping the last nightly."
+
+      - name: Setup Vite+
+        if: steps.merge.outputs.changed == 'true'
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Ensure Electron runtime is installed
+        if: steps.merge.outputs.changed == 'true'
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - name: Setup Rust
+        if: steps.merge.outputs.changed == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve nightly version
+        if: steps.merge.outputs.changed == 'true'
+        id: version
+        run: |
+          node scripts/resolve-nightly-release.ts \
+            --date="$(date -u +%Y%m%d)" \
+            --run-number="${{ github.run_number }}" \
+            --sha="$(git rev-parse HEAD)" \
+            --channel=nightly \
+            --github-output
+
+      - name: Build desktop DMG
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          # Bakes the updater feed to this fork's releases (nightly channel).
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          vp run dist:desktop:dmg:arm64 \
+            --build-version "${{ steps.version.outputs.version }}"
+
+      - name: Publish fork nightly release
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          assets=$(ls release/*.dmg release/*.zip release/*.blockmap release/*.yml 2>/dev/null || true)
+          if [ -z "$assets" ]; then
+            echo "::error::No release assets found in release/."
+            exit 1
+          fi
+          if gh release view fork-nightly > /dev/null 2>&1; then
+            gh release upload fork-nightly $assets --clobber
+          else
+            gh release create fork-nightly $assets \
+              --prerelease \
+              --title "Fork nightly $VERSION" \
+              --notes "Personal fork nightly: upstream main plus the session context usage and cost feature. Built unsigned; update feed points at this fork."
+          fi
+          # Keep the release metadata (name/body) current for the updater UI.
+          gh release edit fork-nightly --prerelease --title "Fork nightly $VERSION" \
+            --notes "Personal fork nightly: upstream main plus the session context usage and cost feature. Built unsigned; update feed points at this fork."
