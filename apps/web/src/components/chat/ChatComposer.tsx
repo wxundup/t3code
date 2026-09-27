@@ -34,6 +34,7 @@ import type {
   ThreadId,
   SnapShotSource,
 } from "@t3tools/contracts";
+import { type UsageThreadUsage, emptyUsageThreadUsage } from "@t3tools/contracts";
 import {
   ProviderDriverKind,
   ProviderInstanceId,
@@ -178,6 +179,7 @@ import {
 import { isCommandPaletteOpen } from "../../commandPaletteBus";
 import { getTerminalFocusOwner } from "../../lib/terminalFocus";
 import type { AssistantCitationSourceAnchor } from "~/lib/assistantTextSelection";
+import type { ContextWindowSnapshot } from "~/lib/contextWindow";
 import { formatThreadUsageLabel } from "~/lib/usageLabel";
 import { useThreadUsage } from "~/state/usage";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../../keybindings";
@@ -1319,6 +1321,8 @@ export interface ChatComposerProps {
   activeThread: Thread | undefined;
   /** The routed server thread's shell, present before its detail loads. */
   activeThreadShell: ThreadShell | null;
+  /** Latest live context fill from the thread's activity feed, null when none has arrived. */
+  liveContextWindow: ContextWindowSnapshot | null;
   /** Timeline messages including optimistic sends, for ArrowUp prompt recall. */
   promptHistoryMessages: ReadonlyArray<ChatMessage>;
   isServerThread: boolean;
@@ -2060,12 +2064,25 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // Context window
   // ------------------------------------------------------------------
   // The floating line shows usage and cost only; the model name lives in the
-  // footer picker right below it.
+  // footer picker right below it. Context fill comes from the thread's live
+  // activity feed when one has arrived (fresher than the scan), with the
+  // scan's snapshot as fallback; cost always comes from the scan.
   const threadUsage = useThreadUsage(
     props.activeThreadEnvironmentId ?? props.environmentId,
     props.activeThreadId,
   );
-  const threadUsageLabel = formatThreadUsageLabel(null, threadUsage);
+  const usage: UsageThreadUsage | null =
+    threadUsage !== null || props.liveContextWindow !== null
+      ? {
+          ...emptyUsageThreadUsage(),
+          ...threadUsage,
+          contextUsedTokens:
+            props.liveContextWindow?.usedTokens ?? threadUsage?.contextUsedTokens ?? null,
+          contextMaxTokens:
+            props.liveContextWindow?.maxTokens ?? threadUsage?.contextMaxTokens ?? null,
+        }
+      : null;
+  const threadUsageLabel = formatThreadUsageLabel(null, usage);
   const contextUsageReserve = threadShellHasStarted(props.activeThreadShell);
 
   // ------------------------------------------------------------------
@@ -5153,13 +5170,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const bannerStackItems = activityStackItem
     ? [activityStackItem, ...props.bannerItems]
     : props.bannerItems;
-  // The floating usage line above the box yields its side to anything showing
-  // in the composer's top dock: banners, the activity/tasks row, top drawers.
-  const contextUsageOccupied =
-    hasBannerItems ||
-    showComposerTopDrawer ||
-    showTasksTab ||
-    (!activityStackItem && Boolean(shownSyncPhase || inlineTasksBadge));
+  // The floating usage line above the box yields only to full-width surfaces
+  // covering the composer's top edge: banners, top drawers, the expanded
+  // tasks drawer. Corner chips (tasks badge, activity row) don't move it —
+  // they come and go during every turn, and dodging them made the line hop
+  // sides constantly.
+  const contextUsageOccupied = hasBannerItems || showComposerTopDrawer || isTasksDrawerOpen;
   useEffect(() => {
     if (activeTasksProgress === null || activeTaskSteps === null) {
       setIsTasksDrawerOpen(false);

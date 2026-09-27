@@ -4,9 +4,11 @@ import { formatUsd } from "@t3tools/shared/usageFormat";
 import { formatContextWindowUsage } from "~/lib/contextWindow";
 
 /**
- * `model · 32% · 81.7k/258k ($1.24)`. The usage segment is omitted when the
- * provider reports no context fill, and the cost segment disappears when the
- * usage scan has no price for the thread. Null when there is nothing to show.
+ * `32% · 81.7k/258k · $1.24`. The usage segment is omitted when the provider
+ * reports no context fill, and the cost segment disappears when the usage
+ * scan has no price for the thread. Cost with no context fill labels its
+ * scope so it never floats unanchored: `session $1.24`. Null when there is
+ * nothing to show.
  */
 export function formatThreadUsageLabel(
   modelLabel: string | null,
@@ -16,15 +18,15 @@ export function formatThreadUsageLabel(
   if (modelLabel !== null && modelLabel.trim().length > 0) {
     segments.push(modelLabel);
   }
-  let cost: string | null = null;
-  if (usage?.costUsd != null) {
-    cost = `(${formatUsd(usage.costUsd)})`;
-  }
   if (usage?.contextUsedTokens != null) {
-    const usageLabel = formatContextWindowUsage(usage.contextUsedTokens, usage.contextMaxTokens);
-    segments.push(cost === null ? usageLabel : `${usageLabel} ${cost}`);
-  } else if (cost !== null) {
-    segments.push(cost);
+    segments.push(formatContextWindowUsage(usage.contextUsedTokens, usage.contextMaxTokens));
+  }
+  if (usage?.costUsd != null) {
+    segments.push(
+      usage.contextUsedTokens == null
+        ? `session ${formatUsd(usage.costUsd)}`
+        : formatUsd(usage.costUsd),
+    );
   }
   return segments.length === 0 ? null : segments.join(" · ");
 }

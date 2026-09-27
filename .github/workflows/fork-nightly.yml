@@ -91,9 +91,14 @@ jobs:
         if: steps.merge.outputs.changed == 'true'
         id: version
         run: |
+          # Stock nightlies carry upstream's run number in the version; the
+          # fork has none, so stamp the build time (HHMM) instead. Reads like
+          # upstream, always increases, and stays fresh-looking next to stock.
+          rn="$(date -u +%H%M)"
+          [ "$rn" = "0000" ] && rn=1
           node scripts/resolve-nightly-release.ts \
             --date="$(date -u +%Y%m%d)" \
-            --run-number="${{ github.run_number }}" \
+            --run-number="$rn" \
             --sha="$(git rev-parse HEAD)" \
             --channel=nightly \
             --github-output
@@ -103,6 +108,14 @@ jobs:
         env:
           # Bakes the updater feed to this fork's releases (nightly channel).
           T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+          # Public T3 Connect config, extracted from upstream's shipped
+          # nightlies (the same values their release pipeline bakes from repo
+          # vars). Without these the bundled server rejects every relay
+          # operation and T3 Connect cannot pair from phones or other
+          # computers.
+          T3CODE_RELAY_URL: "https://relay.t3.codes"
+          T3CODE_CLERK_PUBLISHABLE_KEY: "pk_live_Y2xlcmsudDMuY29kZXMk"
+          T3CODE_CLERK_CLI_OAUTH_CLIENT_ID: "hzxSgY2cH10sDU2r"
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           vp run dist:desktop:dmg:arm64 \

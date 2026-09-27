@@ -10000,6 +10000,7 @@ export default function ChatView(props: ChatViewProps) {
                             activeThreadEnvironmentId={activeThread?.environmentId}
                             activeThread={activeThread}
                             activeThreadShell={routeServerThreadShell}
+                            liveContextWindow={activeContextWindow}
                             promptHistoryMessages={timelineMessages}
                             isServerThread={isServerThread}
                             isLocalDraftThread={isLocalDraftThread}
